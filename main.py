@@ -6,7 +6,7 @@ from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardR
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes,
-    filters, ChatJoinRequestHandler
+    filters, ChatJoinRequestHandler, ChatMemberHandler
 )
 import phonenumbers
 from phonenumbers import NumberParseException
@@ -27,7 +27,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 PORT = int(os.getenv('PORT', '8000'))
-BOT_USERNAME = os.getenv('ThePhilippinesbot', 'FilipinoInviteBot')  # Set this to your bot's username (no @)
+BOT_USERNAME = os.getenv('BOT_USERNAME', 'FilipinoInviteBot')  # Set this to your bot's username (no @)
 
 # --- Rate Limiter for spam protection ---
 class RateLimiter:
@@ -642,7 +642,7 @@ def main():
     application.add_handler(CommandHandler("help", bot_manager.handle_help_command))
     application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_manager.handle_new_chat_member))
-    application.add_handler(MessageHandler(filters.StatusUpdate.MY_CHAT_MEMBER, bot_manager.handle_my_chat_member))  # <-- Auto-register handler
+    application.add_handler(ChatMemberHandler(bot_manager.handle_my_chat_member, chat_member_types="my_chat_member"))  # <-- Fixed auto-register handler
     application.add_handler(ChatJoinRequestHandler(bot_manager.handle_join_request))
     logger.info("🇵🇭 Filipino Verification Bot starting...")
     try:
