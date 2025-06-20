@@ -24,7 +24,7 @@ class DatabaseManager:
     def __init__(self, db_path: str = "filipino_bot.db"):
         self.db_path = db_path
         self.init_database()
-    
+
     def init_database(self):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -49,7 +49,7 @@ class DatabaseManager:
         ''')
         conn.commit()
         conn.close()
-    
+
     def add_verified_user(self, user_id: int, username: str, first_name: str, phone_number: str):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -60,7 +60,7 @@ class DatabaseManager:
         ''', (user_id, username or "", first_name or "", phone_number, datetime.now()))
         conn.commit()
         conn.close()
-    
+
     def is_verified(self, user_id: int) -> bool:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -68,14 +68,14 @@ class DatabaseManager:
         result = cursor.fetchone()
         conn.close()
         return result is not None
-    
+
     def ban_user(self, user_id: int):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('UPDATE verified_users SET is_banned = TRUE WHERE user_id = ?', (user_id,))
         conn.commit()
         conn.close()
-    
+
     def add_join_request(self, user_id: int, chat_id: int):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -98,7 +98,7 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
-# Phone Verification Logic
+# Phone Number Verification Logic
 class PhoneVerifier:
     @staticmethod
     def verify_phone_number(phone_number: str) -> dict:
@@ -160,7 +160,14 @@ class FilipinoBotManager:
             # Track join request
             self.db.add_join_request(user.id, chat.id)
             
-            phone_result = self.verifier.verify_phone_number(user.phone_number if user.phone_number else "")
+            # Check if phone number is provided in the join request
+            if not user.phone_number:
+                # Request user to share phone number
+                await context.bot.send_message(user.id, "Please share your phone number to verify your Filipino status.")
+                return
+
+            # Verify the phone number of the user
+            phone_result = self.verifier.verify_phone_number(user.phone_number)
 
             if phone_result['is_filipino']:
                 # ✅ Verified user - Auto-approve
@@ -216,7 +223,7 @@ If you believe this is a mistake, please try again with a valid Philippine phone
 
         except Exception as e:
             logger.error(f"Error handling join request: {e}")
-    
+
     async def start_verification(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start phone verification process"""
         user = update.effective_user
