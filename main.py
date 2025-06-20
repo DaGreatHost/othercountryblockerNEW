@@ -1,7 +1,8 @@
 import os
 import logging
 from datetime import datetime
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, ParseMode
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, ChatJoinRequestHandler
 import phonenumbers
 from phonenumbers import NumberParseException
