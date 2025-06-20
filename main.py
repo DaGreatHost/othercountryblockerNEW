@@ -27,7 +27,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 PORT = int(os.getenv('PORT', '8000'))
-BOT_USERNAME = os.getenv('BOT_USERNAME', 'FilipinoInviteBot')  # Set this to your bot's username (no @)
+BOT_USERNAME = os.getenv('ThePhilippinesbot', 'FilipinoInviteBot')  # Set this to your bot's username (no @)
 
 # --- Rate Limiter for spam protection ---
 class RateLimiter:
