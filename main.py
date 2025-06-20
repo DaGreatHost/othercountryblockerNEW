@@ -27,7 +27,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 PORT = int(os.getenv('PORT', '8000'))
-BOT_USERNAME = os.getenv('ThePhilippinesbot', 'FilipinoInviteBot')  # <-- Set your bot's username here (without @)
+BOT_USERNAME = os.getenv('ThePhilippinesbot', 'FilipinoInviteBot')  # Set this to your bot's username (no @)
 
 # --- Rate Limiter for spam protection ---
 class RateLimiter:
@@ -243,7 +243,7 @@ class PhoneVerifier:
                 'country_code': None
             }
 
-# --- FilipinoBotManager with Invite Send Robustness ---
+# --- FilipinoBotManager with Auto-Register for groups/channels ---
 class FilipinoBotManager:
     def __init__(self):
         if not BOT_TOKEN:
@@ -260,7 +260,7 @@ class FilipinoBotManager:
         managed_groups = self.db.get_managed_groups()
         invite_messages = []
         if not managed_groups:
-            return "❌ No managed groups found. Add the bot to groups first and make it admin."
+            return "❌ No managed groups found. Add the bot to groups or channels first and make it admin."
         for chat_id, chat_title, chat_type in managed_groups:
             try:
                 invite_link = await context.bot.create_chat_invite_link(
@@ -303,9 +303,6 @@ class FilipinoBotManager:
             logger.warning(f"Failed to notify admin of blocked user: {e}")
 
     async def send_invite_links_or_prompt_start(self, user, context, invite_links_msg):
-        """
-        Try to send invite links to the user. If it fails (e.g., user hasn't started the bot), prompt them to start the bot in private.
-        """
         try:
             await context.bot.send_message(
                 user.id,
@@ -343,6 +340,27 @@ class FilipinoBotManager:
                 )
             except Exception:
                 pass
+
+    async def handle_my_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat = update.my_chat_member.chat
+        new_status = update.my_chat_member.new_chat_member.status
+        if new_status in ['administrator', 'creator']:
+            self.db.add_managed_group(chat.id, chat.title or chat.username, chat.type)
+            logger.info(f"Auto-registered {chat.type} [{chat.title}] ({chat.id}) as managed group.")
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"✅ *Auto-registered {chat.type}*\n\n"
+                    f"• Title: {chat.title}\n"
+                    f"• ID: `{chat.id}`\n"
+                    f"• Type: `{chat.type}`\n"
+                    f"Bot is now admin and registered as managed group!",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception:
+                pass
+        elif new_status in ['left', 'kicked']:
+            logger.info(f"Bot removed from {chat.type} [{chat.title}] ({chat.id})")
 
     async def handle_new_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.new_chat_members:
@@ -624,6 +642,7 @@ def main():
     application.add_handler(CommandHandler("help", bot_manager.handle_help_command))
     application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_manager.handle_new_chat_member))
+    application.add_handler(MessageHandler(filters.StatusUpdate.MY_CHAT_MEMBER, bot_manager.handle_my_chat_member))  # <-- Auto-register handler
     application.add_handler(ChatJoinRequestHandler(bot_manager.handle_join_request))
     logger.info("🇵🇭 Filipino Verification Bot starting...")
     try:
