@@ -4,7 +4,8 @@ from datetime import datetime
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from phonenumbers import phonenumbers, NumberParseException
+import phonenumbers
+from phonenumbers import NumberParseException
 import sqlite3
 
 # Configure logging
