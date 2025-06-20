@@ -161,7 +161,7 @@ class FilipinoBotManager:
             self.db.add_join_request(user.id, chat.id)
 
             # Handle case where user hasn't shared their phone number
-            if not user.phone_number:
+            if not self.db.is_verified(user.id):
                 # Request user to share phone number
                 verification_msg = """
 Hi! Please share your phone number to verify your Filipino status.
