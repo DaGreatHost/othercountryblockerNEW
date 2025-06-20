@@ -7,6 +7,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 import phonenumbers
 from phonenumbers import NumberParseException
 import sqlite3
+import signal
+import sys
+import asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -18,6 +21,8 @@ logger = logging.getLogger(__name__)
 # Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # For webhook mode if needed
+PORT = int(os.getenv('PORT', '8000'))
 
 # Database Manager Class
 class DatabaseManager:
@@ -26,7 +31,7 @@ class DatabaseManager:
         self.init_database()
 
     def init_database(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS verified_users (
@@ -51,18 +56,18 @@ class DatabaseManager:
         conn.close()
 
     def add_verified_user(self, user_id: int, username: str, first_name: str, phone_number: str):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO verified_users 
             (user_id, username, first_name, phone_number, verified_date, is_banned)
             VALUES (?, ?, ?, ?, ?, FALSE)
-        ''', (user_id, username or "", first_name or "", phone_number, datetime.now()))
+        ''', (user_id, username or "", first_name or "", phone_number, datetime.now().isoformat()))
         conn.commit()
         conn.close()
 
     def is_verified(self, user_id: int) -> bool:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute('SELECT user_id FROM verified_users WHERE user_id = ? AND is_banned = FALSE', (user_id,))
         result = cursor.fetchone()
@@ -71,7 +76,7 @@ class DatabaseManager:
 
     def get_user_phone(self, user_id: int) -> str:
         """Get verified phone number for a user"""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute('SELECT phone_number FROM verified_users WHERE user_id = ? AND is_banned = FALSE', (user_id,))
         result = cursor.fetchone()
@@ -79,25 +84,25 @@ class DatabaseManager:
         return result[0] if result else None
 
     def ban_user(self, user_id: int):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute('UPDATE verified_users SET is_banned = TRUE WHERE user_id = ?', (user_id,))
         conn.commit()
         conn.close()
 
     def add_join_request(self, user_id: int, chat_id: int):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO join_requests 
             (user_id, chat_id, request_date, status)
             VALUES (?, ?, ?, 'pending')
-        ''', (user_id, chat_id, datetime.now()))
+        ''', (user_id, chat_id, datetime.now().isoformat()))
         conn.commit()
         conn.close()
 
     def update_join_request_status(self, user_id: int, chat_id: int, status: str):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute('''
             UPDATE join_requests 
@@ -420,15 +425,40 @@ To get verified, use /start and share your Philippine phone number.
         """
         await update.message.reply_text(help_msg, parse_mode=ParseMode.MARKDOWN)
 
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Handle errors"""
+        logger.error(f"Exception while handling an update: {context.error}")
+
+# Global application instance
+application = None
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    logger.info("Received shutdown signal, stopping bot...")
+    if application:
+        asyncio.create_task(application.stop())
+    sys.exit(0)
+
 # Main function to run the bot
 def main():
     """Main function"""
+    global application
+    
     if not BOT_TOKEN or not ADMIN_ID:
         logger.error("BOT_TOKEN and ADMIN_ID environment variables are required!")
         return
     
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     bot_manager = FilipinoBotManager()
+    
+    # Use persistent application to avoid conflicts
     application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add error handler
+    application.add_error_handler(bot_manager.error_handler)
     
     # Add handlers
     application.add_handler(CommandHandler("start", bot_manager.start_verification))
@@ -438,7 +468,18 @@ def main():
     application.add_handler(ChatJoinRequestHandler(bot_manager.handle_join_request))
     
     logger.info("🇵🇭 Filipino Verification Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    try:
+        # Use run_polling with proper error handling
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,  # This helps avoid conflicts
+            close_loop=False
+        )
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
+    finally:
+        logger.info("Bot stopped.")
 
 if __name__ == '__main__':
     main()
