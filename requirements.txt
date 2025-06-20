@@ -1,0 +1,4 @@
+python-telegram-bot==20.0
+phonenumbers==8.12.34
+sqlite3
+python-dotenv
