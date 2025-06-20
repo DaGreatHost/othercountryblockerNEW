@@ -69,6 +69,15 @@ class DatabaseManager:
         conn.close()
         return result is not None
 
+    def get_user_phone(self, user_id: int) -> str:
+        """Get verified phone number for a user"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT phone_number FROM verified_users WHERE user_id = ? AND is_banned = FALSE', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+
     def ban_user(self, user_id: int):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -104,15 +113,19 @@ class PhoneVerifier:
     def verify_phone_number(phone_number: str) -> dict:
         """Verify if phone number is from the Philippines"""
         try:
-            cleaned_number = phone_number.replace(" ", "").replace("-", "")
+            cleaned_number = phone_number.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+            
+            # Handle various Philippine number formats
             if cleaned_number.startswith("09"):
                 cleaned_number = "+63" + cleaned_number[1:]
             elif cleaned_number.startswith("9") and len(cleaned_number) == 10:
                 cleaned_number = "+63" + cleaned_number
             elif cleaned_number.startswith("63") and not cleaned_number.startswith("+63"):
                 cleaned_number = "+" + cleaned_number
-            elif not cleaned_number.startswith("+") and len(cleaned_number) == 10:
+            elif not cleaned_number.startswith("+") and len(cleaned_number) == 11 and cleaned_number.startswith("0"):
                 cleaned_number = "+63" + cleaned_number[1:]
+            elif not cleaned_number.startswith("+") and len(cleaned_number) == 10:
+                cleaned_number = "+63" + cleaned_number
             
             parsed = phonenumbers.parse(cleaned_number)
             region = phonenumbers.region_code_for_number(parsed)
@@ -122,14 +135,18 @@ class PhoneVerifier:
             return {
                 'is_filipino': is_ph,
                 'formatted_number': phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
-                'is_valid': is_valid
+                'is_valid': is_valid,
+                'region': region,
+                'country_code': parsed.country_code if is_valid else None
             }
         except NumberParseException as e:
             logger.error(f"Phone parsing error: {e}")
             return {
                 'is_filipino': False,
                 'formatted_number': phone_number,
-                'is_valid': False
+                'is_valid': False,
+                'region': None,
+                'country_code': None
             }
 
 # FilipinoBotManager class to handle join requests, verifications, and group management
@@ -144,7 +161,7 @@ class FilipinoBotManager:
         self.verifier = PhoneVerifier()
 
     async def handle_join_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle join requests - reject non-PH numbers and remove join request"""
+        """Handle join requests - approve PH numbers, request verification for unverified users"""
         try:
             if not update.chat_join_request:
                 return
@@ -155,79 +172,77 @@ class FilipinoBotManager:
 
             # Skip bots and admin
             if user.is_bot or user.id == ADMIN_ID:
+                await context.bot.approve_chat_join_request(chat.id, user.id)
                 return
 
             # Track join request
             self.db.add_join_request(user.id, chat.id)
 
-            # Handle case where user hasn't shared their phone number
-            if not self.db.is_verified(user.id):
-                # Request user to share phone number
-                verification_msg = """
-Hi! Please share your phone number to verify your Filipino status.
+            # Check if user is already verified
+            if self.db.is_verified(user.id):
+                # Get stored phone number for verification
+                stored_phone = self.db.get_user_phone(user.id)
+                if stored_phone:
+                    phone_result = self.verifier.verify_phone_number(stored_phone)
+                    
+                    if phone_result['is_filipino']:
+                        # ✅ Verified Filipino user - Auto-approve
+                        await context.bot.approve_chat_join_request(chat.id, user.id)
+                        self.db.update_join_request_status(user.id, chat.id, 'approved')
 
-Click the button below to share your phone number:
-"""
-                contact_keyboard = [[KeyboardButton("📱 Share my Phone Number", request_contact=True)]]
-                contact_markup = ReplyKeyboardMarkup(contact_keyboard, one_time_keyboard=True, resize_keyboard=True)
-                
-                await context.bot.send_message(user.id, verification_msg, reply_markup=contact_markup)
-                return
-
-            # Now verify the phone number provided by the user
-            phone_result = self.verifier.verify_phone_number(user.phone_number)
-            
-            if phone_result['is_filipino']:
-                # ✅ Verified user - Auto-approve
-                await context.bot.approve_chat_join_request(chat.id, user.id)
-                self.db.update_join_request_status(user.id, chat.id, 'approved')
-
-                # Send private invite link
-                invite_link = await context.bot.export_chat_invite_link(chat.id)
-                welcome_msg = f"""
+                        # Send welcome message
+                        welcome_msg = f"""
 🎉 **Welcome!** ✅
 
-Hi {user.first_name}, you've been auto-approved to join {chat.title}!
+Hi {user.first_name}, you've been auto-approved to join **{chat.title}**!
 
-Here’s your private invitation link: {invite_link}
-                """
-                await context.bot.send_message(user.id, welcome_msg, parse_mode=ParseMode.MARKDOWN)
+Your Filipino verification status is confirmed. Enjoy the community! 🇵🇭
+                        """
+                        try:
+                            await context.bot.send_message(user.id, welcome_msg, parse_mode=ParseMode.MARKDOWN)
+                        except Exception as e:
+                            logger.warning(f"Could not send welcome message to user {user.id}: {e}")
 
-                # Notify admin
-                admin_notification = f"""
+                        # Notify admin
+                        admin_notification = f"""
 ✅ **Auto-Approved Join Request**
 
 **User:** {user.first_name} (@{user.username or 'no_username'})
 **ID:** `{user.id}`
 **Chat:** {chat.title} (`{chat.id}`)
 **Status:** Verified Filipino User - Auto-approved
-                """
-                await context.bot.send_message(ADMIN_ID, admin_notification, parse_mode=ParseMode.MARKDOWN)
+                        """
+                        try:
+                            await context.bot.send_message(ADMIN_ID, admin_notification, parse_mode=ParseMode.MARKDOWN)
+                        except Exception as e:
+                            logger.warning(f"Could not send admin notification: {e}")
+                        return
+            
+            # User is not verified - request phone verification
+            verification_msg = f"""
+🇵🇭 **Filipino Verification Required**
 
-            else:
-                # ❌ Non-PH number, reject and remove from group
+Hi {user.first_name}! To join **{chat.title}**, please verify your Filipino status by sharing your Philippine phone number.
+
+**How to verify:**
+1. Click the button below to share your phone number
+2. Only Philippine numbers (+63) are accepted
+3. You'll be auto-approved once verified
+
+**Your privacy:** Your phone number is only used for verification purposes.
+
+👇 **Click to share your phone number:**
+            """
+            contact_keyboard = [[KeyboardButton("📱 Share my Philippine Phone Number", request_contact=True)]]
+            contact_markup = ReplyKeyboardMarkup(contact_keyboard, one_time_keyboard=True, resize_keyboard=True)
+            
+            try:
+                await context.bot.send_message(user.id, verification_msg, reply_markup=contact_markup, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                logger.error(f"Could not send verification message to user {user.id}: {e}")
+                # Decline the request if we can't contact the user
                 await context.bot.decline_chat_join_request(chat.id, user.id)
                 self.db.update_join_request_status(user.id, chat.id, 'rejected')
-
-                # Notify user and admin
-                rejection_msg = f"""
-❌ **Join Request Rejected!**
-
-Hi {user.first_name}, unfortunately, your phone number is not from the Philippines. You cannot join **{chat.title}**.
-
-If you believe this is a mistake, please try again with a valid Philippine phone number.
-                """
-                await context.bot.send_message(user.id, rejection_msg, parse_mode=ParseMode.MARKDOWN)
-
-                admin_notification = f"""
-⚠️ **Non-PH Number Detected!**
-
-**User:** {user.first_name} (@{user.username or 'no_username'})
-**ID:** `{user.id}`
-**Chat:** {chat.title} (`{chat.id}`)
-**Status:** Rejected due to invalid phone number.
-                """
-                await context.bot.send_message(ADMIN_ID, admin_notification, parse_mode=ParseMode.MARKDOWN)
 
         except Exception as e:
             logger.error(f"Error handling join request: {e}")
@@ -235,6 +250,14 @@ If you believe this is a mistake, please try again with a valid Philippine phone
     async def start_verification(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start phone verification process"""
         user = update.effective_user
+        
+        if self.db.is_verified(user.id):
+            await update.message.reply_text(
+                "✅ You are already verified as a Filipino user! 🇵🇭\n\n"
+                "You can now join Filipino groups and channels without additional verification.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return
         
         contact_keyboard = [[KeyboardButton("📱 I-Share ang Phone Number Ko", request_contact=True)]]
         contact_markup = ReplyKeyboardMarkup(
@@ -244,16 +267,21 @@ If you believe this is a mistake, please try again with a valid Philippine phone
         )
         
         verification_msg = f"""
-🇵🇭 *Filipino Verification*
+🇵🇭 **Filipino Verification**
 
-Hi {user.first_name}, to verify your Filipino status, please share your phone number by clicking the button below.
+Hi {user.first_name}! To verify your Filipino status, please share your Philippine phone number by clicking the button below.
 
 **Requirements:**
 • Philippine number (+63) only
 • Click the button below to share
 • Auto-approval once verified
 
-👇 *Click to share:*
+**Benefits:**
+• Access to Filipino groups/channels
+• Auto-approval for future join requests
+• One-time verification process
+
+👇 **Click to share:**
         """
         
         await update.message.reply_text(
@@ -272,7 +300,10 @@ Hi {user.first_name}, to verify your Filipino status, please share your phone nu
         
         # Check if the contact shared is from the user
         if contact.user_id != user.id:
-            await update.message.reply_text("❌ Only your own phone number can be verified!", reply_markup=ReplyKeyboardRemove())
+            await update.message.reply_text(
+                "❌ Only your own phone number can be verified!", 
+                reply_markup=ReplyKeyboardRemove()
+            )
             return
         
         # Verify the phone number
@@ -290,22 +321,104 @@ Welcome to the Filipino community, {user.first_name}!
 
 📱 **Verified Number:** {phone_result['formatted_number']}
 🎉 **Status:** Approved for all Filipino channels/groups
-
 🚀 **Benefit:** Auto-approval for future join requests!
+
+You can now join Filipino groups and will be automatically approved! 🎊
             """
-            await update.message.reply_text(success_msg, parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                success_msg, 
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ReplyKeyboardRemove()
+            )
+
+            # Notify admin
+            admin_notification = f"""
+✅ **New Verified User**
+
+**User:** {user.first_name} (@{user.username or 'no_username'})
+**ID:** `{user.id}`
+**Phone:** {phone_result['formatted_number']}
+**Status:** Successfully verified as Filipino
+            """
+            try:
+                await context.bot.send_message(ADMIN_ID, admin_notification, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                logger.warning(f"Could not send admin notification: {e}")
 
         else:
             # Notify user if not a valid Filipino number
             fail_msg = f"""
 ❌ **Invalid Phone Number!**
 
-• **Detected:** {phone_result['formatted_number']}
+• **Number:** {phone_result['formatted_number']}
 • **Expected:** Philippines 🇵🇭 (+63)
+• **Detected Region:** {phone_result.get('region', 'Unknown')}
 
 **Please try again with a valid Philippine phone number.**
+
+Common formats:
+• +63 9XX XXX XXXX
+• 09XX XXX XXXX
+• 63 9XX XXX XXXX
             """
-            await update.message.reply_text(fail_msg, parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                fail_msg, 
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ReplyKeyboardRemove()
+            )
+
+    async def handle_status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Check verification status"""
+        user = update.effective_user
+        
+        if self.db.is_verified(user.id):
+            phone = self.db.get_user_phone(user.id)
+            status_msg = f"""
+✅ **Verification Status: VERIFIED** 🇵🇭
+
+**User:** {user.first_name}
+**Phone:** {phone}
+**Status:** Active Filipino User
+**Benefits:** Auto-approval for Filipino groups
+
+You're all set! 🎉
+            """
+        else:
+            status_msg = f"""
+❌ **Verification Status: NOT VERIFIED**
+
+**User:** {user.first_name}
+**Status:** Unverified
+
+To get verified, use /start and share your Philippine phone number.
+            """
+        
+        await update.message.reply_text(status_msg, parse_mode=ParseMode.MARKDOWN)
+
+    async def handle_help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show help information"""
+        help_msg = """
+🇵🇭 **Filipino Verification Bot Help**
+
+**Commands:**
+• `/start` - Start verification process
+• `/status` - Check your verification status
+• `/help` - Show this help message
+
+**How it works:**
+1. Use `/start` to begin verification
+2. Share your Philippine phone number
+3. Get auto-approved for Filipino groups
+4. One-time verification for all groups
+
+**Supported formats:**
+• +63 9XX XXX XXXX
+• 09XX XXX XXXX
+• 63 9XX XXX XXXX
+
+**Need help?** Contact the admin if you have issues.
+        """
+        await update.message.reply_text(help_msg, parse_mode=ParseMode.MARKDOWN)
 
 # Main function to run the bot
 def main():
@@ -319,6 +432,8 @@ def main():
     
     # Add handlers
     application.add_handler(CommandHandler("start", bot_manager.start_verification))
+    application.add_handler(CommandHandler("status", bot_manager.handle_status_command))
+    application.add_handler(CommandHandler("help", bot_manager.handle_help_command))
     application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
     application.add_handler(ChatJoinRequestHandler(bot_manager.handle_join_request))
     
