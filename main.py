@@ -52,6 +52,15 @@ class DatabaseManager:
                 PRIMARY KEY (user_id, chat_id)
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS managed_groups (
+                chat_id INTEGER PRIMARY KEY,
+                chat_title TEXT,
+                chat_type TEXT,
+                added_date TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE
+            )
+        ''')
         conn.commit()
         conn.close()
 
@@ -112,6 +121,29 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
+    def add_managed_group(self, chat_id: int, chat_title: str, chat_type: str):
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO managed_groups 
+            (chat_id, chat_title, chat_type, added_date, is_active)
+            VALUES (?, ?, ?, ?, TRUE)
+        ''', (chat_id, chat_title, chat_type, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+
+    def get_managed_groups(self) -> list:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT chat_id, chat_title, chat_type 
+            FROM managed_groups 
+            WHERE is_active = TRUE
+        ''')
+        results = cursor.fetchall()
+        conn.close()
+        return results
+
 # Phone Number Verification Logic
 class PhoneVerifier:
     @staticmethod
@@ -165,7 +197,85 @@ class FilipinoBotManager:
         self.db = DatabaseManager()
         self.verifier = PhoneVerifier()
 
-    async def handle_join_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def generate_invite_links(self, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
+        """Generate one-time invite links for all managed groups"""
+        managed_groups = self.db.get_managed_groups()
+        invite_messages = []
+        
+        if not managed_groups:
+            return "❌ No managed groups found. Add the bot to groups first and make it admin."
+        
+        for chat_id, chat_title, chat_type in managed_groups:
+            try:
+                # Create one-time invite link (expires after 1 use)
+                invite_link = await context.bot.create_chat_invite_link(
+                    chat_id=chat_id,
+                    member_limit=1,  # Only 1 person can use this link
+                    name=f"Filipino-{user_id}",  # Custom name for tracking
+                    creates_join_request=False  # Direct join, no approval needed
+                )
+                
+                # Format the group info
+                group_type = "🔒 Private" if chat_type == "private" else "👥 Group" if chat_type == "group" else "📢 Channel"
+                invite_messages.append(f"{group_type} **{chat_title}**\n🔗 {invite_link.invite_link}")
+                
+            except Exception as e:
+                logger.error(f"Failed to create invite link for {chat_title}: {e}")
+                invite_messages.append(f"❌ **{chat_title}** - Failed to create invite link")
+        
+        return "\n\n".join(invite_messages)
+
+    async def handle_new_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle when bot is added to new groups"""
+        if not update.message or not update.message.new_chat_members:
+            return
+            
+        bot_user = await context.bot.get_me()
+        
+        # Check if our bot was added
+        for member in update.message.new_chat_members:
+            if member.id == bot_user.id:
+                chat = update.effective_chat
+                
+                # Check if bot is admin
+                try:
+                    bot_member = await context.bot.get_chat_member(chat.id, bot_user.id)
+                    if bot_member.status in ['administrator', 'creator']:
+                        # Add to managed groups
+                        self.db.add_managed_group(chat.id, chat.title, chat.type)
+                        
+                        # Notify admin
+                        admin_msg = f"""
+🆕 **Bot Added to New Group**
+
+**Group:** {chat.title}
+**Type:** {chat.type}
+**ID:** `{chat.id}`
+**Status:** Added to managed groups ✅
+
+The bot can now create invite links for this group!
+                        """
+                        try:
+                            await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode=ParseMode.MARKDOWN)
+                        except Exception as e:
+                            logger.warning(f"Could not notify admin: {e}")
+                    else:
+                        # Bot is not admin, notify
+                        warning_msg = f"""
+⚠️ **Bot Added but Not Admin**
+
+**Group:** {chat.title}
+**Issue:** Bot needs admin privileges to create invite links
+
+Please make the bot admin to enable invite link generation.
+                        """
+                        try:
+                            await context.bot.send_message(ADMIN_ID, warning_msg, parse_mode=ParseMode.MARKDOWN)
+                        except Exception as e:
+                            logger.warning(f"Could not notify admin: {e}")
+                            
+                except Exception as e:
+                    logger.error(f"Error checking bot admin status: {e}")
         """Handle join requests - approve PH numbers, request verification for unverified users"""
         try:
             if not update.chat_join_request:
@@ -328,7 +438,10 @@ Welcome to the Filipino community, {user.first_name}!
 🎉 **Status:** Approved for all Filipino channels/groups
 🚀 **Benefit:** Auto-approval for future join requests!
 
-You can now join Filipino groups and will be automatically approved! 🎊
+**🔗 Your Personal Invite Links:**
+{await self.generate_invite_links(context, user.id)}
+
+⚠️ **Important:** These links are ONE-TIME USE only and cannot be shared!
             """
             await update.message.reply_text(
                 success_msg, 
@@ -400,7 +513,79 @@ To get verified, use /start and share your Philippine phone number.
         
         await update.message.reply_text(status_msg, parse_mode=ParseMode.MARKDOWN)
 
-    async def handle_help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def handle_groups_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show available groups and generate new invite links"""
+        user = update.effective_user
+        
+        if not self.db.is_verified(user.id):
+            await update.message.reply_text(
+                "❌ You need to be verified first! Use /start to verify your Filipino phone number.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Generate fresh invite links
+        invite_links_msg = await self.generate_invite_links(context, user.id)
+        
+        groups_msg = f"""
+🇵🇭 **Available Filipino Groups**
+
+Hi {user.first_name}! Here are your personal invite links:
+
+{invite_links_msg}
+
+⚠️ **Important Notes:**
+• These links are ONE-TIME USE only
+• Cannot be shared with others
+• Links expire after you join
+• Use /groups again to get new links
+
+💡 **Tip:** Join the groups you're interested in right away!
+        """
+        
+        await update.message.reply_text(groups_msg, parse_mode=ParseMode.MARKDOWN)
+
+    async def handle_admin_add_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin command to manually add a group"""
+        user = update.effective_user
+        
+        if user.id != ADMIN_ID:
+            await update.message.reply_text("❌ Admin only command!")
+            return
+        
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text(
+                "Usage: /addgroup <chat_id> <group_name>\n"
+                "Example: /addgroup -1001234567890 Filipino Community"
+            )
+            return
+        
+        try:
+            chat_id = int(context.args[0])
+            group_name = " ".join(context.args[1:])
+            
+            # Test if bot can access the group
+            chat = await context.bot.get_chat(chat_id)
+            bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
+            
+            if bot_member.status in ['administrator', 'creator']:
+                self.db.add_managed_group(chat_id, group_name, chat.type)
+                await update.message.reply_text(
+                    f"✅ Added **{group_name}** to managed groups!\n"
+                    f"Chat ID: `{chat_id}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Bot is not admin in **{group_name}**!\n"
+                    "Make the bot admin first.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+        except ValueError:
+            await update.message.reply_text("❌ Invalid chat ID format!")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {str(e)}")
         """Show help information"""
         help_msg = """
 🇵🇭 **Filipino Verification Bot Help**
@@ -463,8 +648,11 @@ def main():
     # Add handlers
     application.add_handler(CommandHandler("start", bot_manager.start_verification))
     application.add_handler(CommandHandler("status", bot_manager.handle_status_command))
+    application.add_handler(CommandHandler("groups", bot_manager.handle_groups_command))
+    application.add_handler(CommandHandler("addgroup", bot_manager.handle_admin_add_group))
     application.add_handler(CommandHandler("help", bot_manager.handle_help_command))
     application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_manager.handle_new_chat_member))
     application.add_handler(ChatJoinRequestHandler(bot_manager.handle_join_request))
     
     logger.info("🇵🇭 Filipino Verification Bot starting...")
