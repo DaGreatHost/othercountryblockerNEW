@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, ChatJoinRequestHandler
 import phonenumbers
 from phonenumbers import NumberParseException
 import sqlite3
@@ -152,23 +152,31 @@ class FilipinoBotManager:
             join_request = update.chat_join_request
             user = join_request.from_user
             chat = join_request.chat
-            
+
             # Skip bots and admin
             if user.is_bot or user.id == ADMIN_ID:
                 return
 
             # Track join request
             self.db.add_join_request(user.id, chat.id)
-            
-            # Check if phone number is provided in the join request
+
+            # Handle case where user hasn't shared their phone number
             if not user.phone_number:
                 # Request user to share phone number
-                await context.bot.send_message(user.id, "Please share your phone number to verify your Filipino status.")
+                verification_msg = """
+Hi! Please share your phone number to verify your Filipino status.
+
+Click the button below to share your phone number:
+"""
+                contact_keyboard = [[KeyboardButton("📱 Share my Phone Number", request_contact=True)]]
+                contact_markup = ReplyKeyboardMarkup(contact_keyboard, one_time_keyboard=True, resize_keyboard=True)
+                
+                await context.bot.send_message(user.id, verification_msg, reply_markup=contact_markup)
                 return
 
-            # Verify the phone number of the user
+            # Now verify the phone number provided by the user
             phone_result = self.verifier.verify_phone_number(user.phone_number)
-
+            
             if phone_result['is_filipino']:
                 # ✅ Verified user - Auto-approve
                 await context.bot.approve_chat_join_request(chat.id, user.id)
@@ -184,7 +192,7 @@ Hi {user.first_name}, you've been auto-approved to join {chat.title}!
 Here’s your private invitation link: {invite_link}
                 """
                 await context.bot.send_message(user.id, welcome_msg, parse_mode=ParseMode.MARKDOWN)
-                
+
                 # Notify admin
                 admin_notification = f"""
 ✅ **Auto-Approved Join Request**
@@ -200,7 +208,7 @@ Here’s your private invitation link: {invite_link}
                 # ❌ Non-PH number, reject and remove from group
                 await context.bot.decline_chat_join_request(chat.id, user.id)
                 self.db.update_join_request_status(user.id, chat.id, 'rejected')
-                
+
                 # Notify user and admin
                 rejection_msg = f"""
 ❌ **Join Request Rejected!**
@@ -298,3 +306,24 @@ Welcome to the Filipino community, {user.first_name}!
 **Please try again with a valid Philippine phone number.**
             """
             await update.message.reply_text(fail_msg, parse_mode=ParseMode.MARKDOWN)
+
+# Main function to run the bot
+def main():
+    """Main function"""
+    if not BOT_TOKEN or not ADMIN_ID:
+        logger.error("BOT_TOKEN and ADMIN_ID environment variables are required!")
+        return
+    
+    bot_manager = FilipinoBotManager()
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", bot_manager.start_verification))
+    application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
+    application.add_handler(ChatJoinRequestHandler(bot_manager.handle_join_request))
+    
+    logger.info("🇵🇭 Filipino Verification Bot starting...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
