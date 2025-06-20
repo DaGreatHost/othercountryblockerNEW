@@ -518,22 +518,22 @@ class FilipinoBotManager:
 
     async def handle_help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_msg = (
-            "🇵🇭 **Filipino Verification Bot Help**\n\n"
-            "**Commands:**\n"
+            "🇵🇭 *Filipino Verification Bot Help*\n\n"
+            "*Commands:*\n"
             "• `/start` - Start verification process\n"
             "• `/status` - Check your verification status\n"
             "• `/groups` - Get your invite links\n"
             "• `/help` - Show this help message\n\n"
-            "**How it works:**\n"
+            "*How it works:*\n"
             "1. Use `/start` to begin verification\n"
             "2. Share your Philippine phone number\n"
             "3. Get auto-approved for Filipino groups\n"
             "4. One-time verification for all groups\n\n"
-            "**Supported formats:**\n"
+            "*Supported formats:*\n"
             "• +63 9XX XXX XXXX\n"
             "• 09XX XXX XXXX\n"
             "• 63 9XX XXX XXXX\n\n"
-            "**Need help?** Contact the admin if you have issues."
+            "*Need help?* Contact the admin if you have issues."
         )
         await update.message.reply_text(help_msg, parse_mode=ParseMode.MARKDOWN)
 
