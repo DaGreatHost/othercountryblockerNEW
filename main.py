@@ -27,6 +27,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 PORT = int(os.getenv('PORT', '8000'))
+BOT_USERNAME = os.getenv('BOT_USERNAME', 'FilipinoInviteBot')  # <-- Set your bot's username here (without @)
 
 # --- Rate Limiter for spam protection ---
 class RateLimiter:
@@ -242,7 +243,7 @@ class PhoneVerifier:
                 'country_code': None
             }
 
-# --- FilipinoBotManager with Anti-Spam ---
+# --- FilipinoBotManager with Invite Send Robustness ---
 class FilipinoBotManager:
     def __init__(self):
         if not BOT_TOKEN:
@@ -300,6 +301,48 @@ class FilipinoBotManager:
                 )
         except Exception as e:
             logger.warning(f"Failed to notify admin of blocked user: {e}")
+
+    async def send_invite_links_or_prompt_start(self, user, context, invite_links_msg):
+        """
+        Try to send invite links to the user. If it fails (e.g., user hasn't started the bot), prompt them to start the bot in private.
+        """
+        try:
+            await context.bot.send_message(
+                user.id,
+                invite_links_msg,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ReplyKeyboardRemove()
+            )
+        except Exception as e:
+            logger.warning(f"Could not send private invite to user {user.id}: {e}")
+            if hasattr(user, "username") and user.username:
+                fallback_msg = (
+                    f"❗ Hi @{user.username}, I couldn't send you your group invite links in private.\n\n"
+                    f"➡️ Please open [this bot in private chat](https://t.me/{BOT_USERNAME}) and click /start. "
+                    f"Once you have done that, use /groups to get your invite links."
+                )
+            else:
+                fallback_msg = (
+                    f"❗ I couldn't send you your group invite links in private.\n\n"
+                    f"➡️ Please open this bot in private chat (@{BOT_USERNAME}), press /start, then use /groups to get your invite links."
+                )
+            try:
+                await context.bot.send_message(
+                    user.id,
+                    fallback_msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                pass
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ Failed to send invite links to user {user.id}. Reason: {e}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception:
+                pass
 
     async def handle_new_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.new_chat_members:
@@ -411,6 +454,8 @@ class FilipinoBotManager:
             f"• Access to Filipino groups/channels\n"
             f"• Auto-approval for future join requests\n"
             f"• One-time verification process\n\n"
+            f"⚠️ *Important:* You must open this bot in private chat and click /start to receive private invites! "
+            f"If you do not receive your links, do this and use /groups again.\n\n"
             f"👇 **Click to share:**"
         )
         await update.message.reply_text(verification_msg, parse_mode=ParseMode.MARKDOWN, reply_markup=contact_markup)
@@ -435,20 +480,34 @@ class FilipinoBotManager:
         phone_result = self.verifier.verify_phone_number(contact.phone_number)
         if phone_result['is_filipino']:
             self.db.add_verified_user(user.id, user.username, user.first_name, contact.phone_number)
-            await update.message.reply_text(
-                f"✅ **Verified!** 🇵🇭\n\nWelcome to the Filipino community, {user.first_name}!\n\n📱 **Verified Number:** {phone_result['formatted_number']}\n🎉 **Status:** Approved for all Filipino channels/groups\n🚀 **Benefit:** Auto-approval for future join requests!\n\n**🔗 Your Personal Invite Links:**\n{await self.generate_invite_links(context, user.id)}\n\n⚠️ **Important:** These links are ONE-TIME USE only and cannot be shared!",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=ReplyKeyboardRemove()
+            invite_links_msg = (
+                f"✅ **Verified!** 🇵🇭\n\n"
+                f"Welcome to the Filipino community, {user.first_name}!\n\n"
+                f"📱 **Verified Number:** {phone_result['formatted_number']}\n"
+                f"🎉 **Status:** Approved for all Filipino channels/groups\n"
+                f"🚀 **Benefit:** Auto-approval for future join requests!\n\n"
+                f"**🔗 Your Personal Invite Links:**\n"
+                f"{await self.generate_invite_links(context, user.id)}\n\n"
+                f"⚠️ **Important:** These links are ONE-TIME USE only and cannot be shared!\n\n"
+                f"__If you do not receive the links, please open this bot in private chat and click /start, then use /groups to get your links.__"
             )
+            await self.send_invite_links_or_prompt_start(user, context, invite_links_msg)
             try:
-                await context.bot.send_message(ADMIN_ID,
-                    f"✅ **New Verified User**\n\n**User:** {user.first_name} (@{user.username or 'no_username'})\n**ID:** `{user.id}`\n**Phone:** {phone_result['formatted_number']}\n**Status:** Successfully verified as Filipino",
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"✅ **New Verified User**\n\n**User:** {user.first_name} (@{user.username or 'no_username'})\n"
+                    f"**ID:** `{user.id}`\n**Phone:** {phone_result['formatted_number']}\n"
+                    f"**Status:** Successfully verified as Filipino",
                     parse_mode=ParseMode.MARKDOWN
                 )
-            except Exception: pass
+            except Exception:
+                pass
         else:
             await update.message.reply_text(
-                f"❌ **Invalid Phone Number!**\n\n• **Number:** {phone_result['formatted_number']}\n• **Expected:** Philippines 🇵🇭 (+63)\n• **Detected Region:** {phone_result.get('region', 'Unknown')}\n\n**Please try again with a valid Philippine phone number.**\n\nCommon formats:\n• +63 9XX XXX XXXX\n• 09XX XXX XXXX\n• 63 9XX XXX XXXX",
+                f"❌ **Invalid Phone Number!**\n\n• **Number:** {phone_result['formatted_number']}\n• **Expected:** Philippines 🇵🇭 (+63)\n"
+                f"• **Detected Region:** {phone_result.get('region', 'Unknown')}\n\n"
+                "**Please try again with a valid Philippine phone number.**\n\n"
+                "Common formats:\n• +63 9XX XXX XXXX\n• 09XX XXX XXXX\n• 63 9XX XXX XXXX",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=ReplyKeyboardRemove()
             )
@@ -471,19 +530,16 @@ class FilipinoBotManager:
                 parse_mode=ParseMode.MARKDOWN
             )
             return
-        invite_links_msg = await self.generate_invite_links(context, user.id)
-        groups_msg = (
-            f"🇵🇭 **Available Filipino Groups**\n\n"
-            f"Hi {user.first_name}! Here are your personal invite links:\n\n"
-            f"{invite_links_msg}\n\n"
-            f"⚠️ **Important Notes:**\n"
-            f"• These links are ONE-TIME USE only\n"
-            f"• Cannot be shared with others\n"
-            f"• Links expire after you join\n"
-            f"• Use /groups again to get new links\n\n"
-            f"💡 **Tip:** Join the groups you're interested in right away!"
-        )
-        await update.message.reply_text(groups_msg, parse_mode=ParseMode.MARKDOWN)
+        invite_links_msg = f"🇵🇭 **Available Filipino Groups**\n\nHi {user.first_name}! Here are your personal invite links:\n\n" \
+                           f"{await self.generate_invite_links(context, user.id)}\n\n" \
+                           f"⚠️ **Important Notes:**\n" \
+                           f"• These links are ONE-TIME USE only\n" \
+                           f"• Cannot be shared with others\n" \
+                           f"• Links expire after you join\n" \
+                           f"• Use /groups again to get new links\n\n" \
+                           f"💡 **Tip:** Join the groups you're interested in right away!\n\n" \
+                           f"__If you do not receive the links, please open this bot in private chat and click /start, then use /groups again.__"
+        await self.send_invite_links_or_prompt_start(user, context, invite_links_msg)
 
     async def handle_admin_add_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -525,7 +581,7 @@ class FilipinoBotManager:
             "• `/groups` - Get your invite links\n"
             "• `/help` - Show this help message\n\n"
             "*How it works:*\n"
-            "1. Use `/start` to begin verification\n"
+            "1. Use `/start` to begin verification (in private chat!)\n"
             "2. Share your Philippine phone number\n"
             "3. Get auto-approved for Filipino groups\n"
             "4. One-time verification for all groups\n\n"
@@ -533,6 +589,8 @@ class FilipinoBotManager:
             "• +63 9XX XXX XXXX\n"
             "• 09XX XXX XXXX\n"
             "• 63 9XX XXX XXXX\n\n"
+            "⚠️ *Important:* You must open this bot in private chat and click /start to receive private invites! "
+            "If you do not receive your links, do this and use /groups again.\n\n"
             "*Need help?* Contact the admin if you have issues."
         )
         await update.message.reply_text(help_msg, parse_mode=ParseMode.MARKDOWN)
