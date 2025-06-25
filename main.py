@@ -8,653 +8,516 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes,
     filters, ChatJoinRequestHandler, ChatMemberHandler
 )
+from telegram.error import TelegramError
 import phonenumbers
 from phonenumbers import NumberParseException
-import sqlite3
+import aiosqlite  # Using aiosqlite for async database operations
 import signal
 import sys
 import asyncio
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Configuration
+# --- Configuration ---
+# It's recommended to load these from a .env file or environment variables for security.
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
-WEBHOOK_URL = os.getenv('WEBHOOK_URL')
-PORT = int(os.getenv('PORT', '8000'))
-BOT_USERNAME = os.getenv('ThePhilippinesbot', 'FilipinoInviteBot')  # Set this to your bot's username (no @)
+# Set this to your bot's username (without the '@')
+BOT_USERNAME = os.getenv('BOT_USERNAME', 'YourBotUsername') 
 
-# --- Rate Limiter for spam protection ---
+# --- Logging Setup ---
+# A more detailed logging format can be helpful for debugging.
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s] - %(message)s',
+    level=logging.INFO
+)
+# Suppress noisy logs from the HTTPX library used by python-telegram-bot
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+# --- Rate Limiter ---
+# This class helps prevent spam and abuse by limiting user actions.
 class RateLimiter:
     def __init__(self):
-        self.verification_attempts = defaultdict(list)
-        self.join_attempts = defaultdict(list)
-        self.spam_messages = defaultdict(list)
-        self.verification_limit = 3  # per 24h
-        self.join_limit = 5  # per 24h
-        self.message_limit = 20  # per minute
+        # Using defaultdict with a default factory simplifies adding new users.
+        self.attempts = defaultdict(lambda: {'verification': [], 'join': [], 'message': []})
+        self.limits = {
+            'verification': (3, timedelta(days=1)),    # 3 attempts per 24 hours
+            'join': (5, timedelta(days=1)),            # 5 attempts per 24 hours
+            'message': (20, timedelta(minutes=1)),     # 20 messages per minute
+        }
 
-    def _cleanup(self, user_id, key, window):
+    def _cleanup_and_check(self, user_id: int, key: str) -> bool:
+        """Removes expired timestamps and checks if the user is within the limit."""
         now = datetime.now()
-        attempts = getattr(self, key)[user_id]
-        setattr(self, key, {
-            **getattr(self, key),
-            user_id: [t for t in attempts if now - t < window]
-        })
+        limit, window = self.limits[key]
+        # Filter out old timestamps
+        valid_attempts = [t for t in self.attempts[user_id][key] if now - t < window]
+        self.attempts[user_id][key] = valid_attempts
+        return len(valid_attempts) < limit
 
-    def can_verify(self, user_id):
-        self._cleanup(user_id, 'verification_attempts', timedelta(days=1))
-        return len(self.verification_attempts[user_id]) < self.verification_limit
+    def record_attempt(self, user_id: int, key: str):
+        """Records a new timestamp for a user's action."""
+        self.attempts[user_id][key].append(datetime.now())
 
-    def record_verification(self, user_id):
-        self.verification_attempts[user_id].append(datetime.now())
+    def can_verify(self, user_id: int) -> bool:
+        return self._cleanup_and_check(user_id, 'verification')
 
-    def can_join(self, user_id):
-        self._cleanup(user_id, 'join_attempts', timedelta(days=1))
-        return len(self.join_attempts[user_id]) < self.join_limit
+    def can_join(self, user_id: int) -> bool:
+        return self._cleanup_and_check(user_id, 'join')
 
-    def record_join(self, user_id):
-        self.join_attempts[user_id].append(datetime.now())
-
-    def can_message(self, user_id):
-        self._cleanup(user_id, 'spam_messages', timedelta(minutes=1))
-        return len(self.spam_messages[user_id]) < self.message_limit
-
-    def record_message(self, user_id):
-        self.spam_messages[user_id].append(datetime.now())
+    def can_message(self, user_id: int) -> bool:
+        return self._cleanup_and_check(user_id, 'message')
 
 # --- Database Manager ---
+# CRITICAL FIX: Using `aiosqlite` for non-blocking database operations, which is
+# essential for an `asyncio`-based application like this bot. Using standard
+# `sqlite3` would block the entire bot.
 class DatabaseManager:
     def __init__(self, db_path: str = "filipino_bot.db"):
         self.db_path = db_path
-        self.init_database()
 
-    def init_database(self):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS verified_users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                phone_number TEXT,
-                verified_date TIMESTAMP,
-                is_banned BOOLEAN DEFAULT FALSE
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS join_requests (
-                user_id INTEGER,
-                chat_id INTEGER,
-                request_date TIMESTAMP,
-                status TEXT DEFAULT 'pending',
-                PRIMARY KEY (user_id, chat_id)
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS managed_groups (
-                chat_id INTEGER PRIMARY KEY,
-                chat_title TEXT,
-                chat_type TEXT,
-                added_date TIMESTAMP,
-                is_active BOOLEAN DEFAULT TRUE
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS spam_tracking (
-                user_id INTEGER,
-                incident_type TEXT,
-                incident_time TIMESTAMP,
-                details TEXT,
-                PRIMARY KEY (user_id, incident_time)
-            )
-        ''')
-        conn.commit()
-        conn.close()
+    async def init_database(self):
+        """Initializes the database schema."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS verified_users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    phone_number TEXT,
+                    verified_date TIMESTAMP,
+                    is_banned BOOLEAN DEFAULT FALSE
+                )
+            ''')
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS join_requests (
+                    user_id INTEGER,
+                    chat_id INTEGER,
+                    request_date TIMESTAMP,
+                    status TEXT DEFAULT 'pending',
+                    PRIMARY KEY (user_id, chat_id)
+                )
+            ''')
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS managed_groups (
+                    chat_id INTEGER PRIMARY KEY,
+                    chat_title TEXT,
+                    chat_type TEXT,
+                    added_date TIMESTAMP,
+                    is_active BOOLEAN DEFAULT TRUE
+                )
+            ''')
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS spam_tracking (
+                    user_id INTEGER,
+                    incident_type TEXT,
+                    incident_time TIMESTAMP,
+                    details TEXT,
+                    PRIMARY KEY (user_id, incident_time)
+                )
+            ''')
+            await db.commit()
+            logger.info("Database initialized successfully.")
 
-    def add_verified_user(self, user_id: int, username: str, first_name: str, phone_number: str):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO verified_users 
-            (user_id, username, first_name, phone_number, verified_date, is_banned)
-            VALUES (?, ?, ?, ?, ?, FALSE)
-        ''', (user_id, username or "", first_name or "", phone_number, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
+    async def add_verified_user(self, user_id: int, username: str, first_name: str, phone_number: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO verified_users 
+                (user_id, username, first_name, phone_number, verified_date, is_banned)
+                VALUES (?, ?, ?, ?, ?, FALSE)
+            ''', (user_id, username or "", first_name or "", phone_number, datetime.now()))
+            await db.commit()
 
-    def is_verified(self, user_id: int) -> bool:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id FROM verified_users WHERE user_id = ? AND is_banned = FALSE', (user_id,))
-        result = cursor.fetchone()
-        conn.close()
-        return result is not None
+    async def is_verified(self, user_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute('SELECT 1 FROM verified_users WHERE user_id = ? AND is_banned = FALSE', (user_id,)) as cursor:
+                return await cursor.fetchone() is not None
 
-    def get_user_phone(self, user_id: int) -> str:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute('SELECT phone_number FROM verified_users WHERE user_id = ? AND is_banned = FALSE', (user_id,))
-        result = cursor.fetchone()
-        conn.close()
-        return result[0] if result else None
+    async def get_user_phone(self, user_id: int) -> str | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute('SELECT phone_number FROM verified_users WHERE user_id = ?', (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else None
 
-    def ban_user(self, user_id: int):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute('UPDATE verified_users SET is_banned = TRUE WHERE user_id = ?', (user_id,))
-        conn.commit()
-        conn.close()
+    async def ban_user(self, user_id: int):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('UPDATE verified_users SET is_banned = TRUE WHERE user_id = ?', (user_id,))
+            await db.commit()
 
-    def add_join_request(self, user_id: int, chat_id: int):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO join_requests 
-            (user_id, chat_id, request_date, status)
-            VALUES (?, ?, ?, 'pending')
-        ''', (user_id, chat_id, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
+    async def add_managed_group(self, chat_id: int, chat_title: str, chat_type: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT OR REPLACE INTO managed_groups 
+                (chat_id, chat_title, chat_type, added_date, is_active)
+                VALUES (?, ?, ?, ?, TRUE)
+            ''', (chat_id, chat_title, chat_type, datetime.now()))
+            await db.commit()
 
-    def update_join_request_status(self, user_id: int, chat_id: int, status: str):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE join_requests 
-            SET status = ? 
-            WHERE user_id = ? AND chat_id = ?
-        ''', (status, user_id, chat_id))
-        conn.commit()
-        conn.close()
+    async def get_managed_groups(self) -> list:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('SELECT chat_id, chat_title, chat_type FROM managed_groups WHERE is_active = TRUE') as cursor:
+                return await cursor.fetchall()
 
-    def add_managed_group(self, chat_id: int, chat_title: str, chat_type: str):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO managed_groups 
-            (chat_id, chat_title, chat_type, added_date, is_active)
-            VALUES (?, ?, ?, ?, TRUE)
-        ''', (chat_id, chat_title, chat_type, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-
-    def get_managed_groups(self) -> list:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT chat_id, chat_title, chat_type 
-            FROM managed_groups 
-            WHERE is_active = TRUE
-        ''')
-        results = cursor.fetchall()
-        conn.close()
-        return results
-
-    def log_spam_incident(self, user_id: int, incident_type: str, details: str):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO spam_tracking (user_id, incident_type, incident_time, details)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, incident_type, datetime.now().isoformat(), details))
-        conn.commit()
-        conn.close()
+    async def log_spam_incident(self, user_id: int, incident_type: str, details: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT INTO spam_tracking (user_id, incident_type, incident_time, details)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, incident_type, datetime.now(), details))
+            await db.commit()
 
 # --- Phone Number Verification ---
 class PhoneVerifier:
     @staticmethod
     def verify_phone_number(phone_number: str) -> dict:
+        """
+        Cleans and validates a phone number, specifically checking if it's a valid Philippine number.
+        The cleaning logic is enhanced to handle more common user input formats.
+        """
+        if not phone_number:
+            return {'is_filipino': False, 'is_valid': False, 'formatted_number': ''}
+            
         try:
-            cleaned_number = phone_number.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-            if cleaned_number.startswith("09"):
-                cleaned_number = "+63" + cleaned_number[1:]
-            elif cleaned_number.startswith("9") and len(cleaned_number) == 10:
-                cleaned_number = "+63" + cleaned_number
-            elif cleaned_number.startswith("63") and not cleaned_number.startswith("+63"):
-                cleaned_number = "+" + cleaned_number
-            elif not cleaned_number.startswith("+") and len(cleaned_number) == 11 and cleaned_number.startswith("0"):
-                cleaned_number = "+63" + cleaned_number[1:]
-            elif not cleaned_number.startswith("+") and len(cleaned_number) == 10:
-                cleaned_number = "+63" + cleaned_number
+            # Normalize the number: remove common separators and handle local formats
+            cleaned_number = ''.join(filter(str.isdigit, phone_number))
+            if len(cleaned_number) == 10 and cleaned_number.startswith('9'):
+                # Format: 9171234567 -> +639171234567
+                cleaned_number = f"+63{cleaned_number}"
+            elif len(cleaned_number) == 11 and cleaned_number.startswith('09'):
+                # Format: 09171234567 -> +639171234567
+                cleaned_number = f"+63{cleaned_number[1:]}"
+            elif len(cleaned_number) == 12 and cleaned_number.startswith('639'):
+                # Format: 639171234567 -> +639171234567
+                cleaned_number = f"+{cleaned_number}"
+            elif not phone_number.startswith('+'):
+                 # Add '+' if it's missing but looks like an international number
+                 cleaned_number = f"+{cleaned_number}"
+            else:
+                 cleaned_number = phone_number
+
             parsed = phonenumbers.parse(cleaned_number)
-            region = phonenumbers.region_code_for_number(parsed)
             is_valid = phonenumbers.is_valid_number(parsed)
-            is_ph = region == 'PH' and parsed.country_code == 63 and is_valid
+            is_ph = phonenumbers.region_code_for_number(parsed) == 'PH'
+
             return {
-                'is_filipino': is_ph,
-                'formatted_number': phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
+                'is_filipino': is_ph and is_valid,
                 'is_valid': is_valid,
-                'region': region,
-                'country_code': parsed.country_code if is_valid else None
+                'formatted_number': phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL) if is_valid else phone_number,
+                'region': phonenumbers.region_code_for_number(parsed) if is_valid else 'Unknown'
             }
         except NumberParseException as e:
-            logger.error(f"Phone parsing error: {e}")
-            return {
-                'is_filipino': False,
-                'formatted_number': phone_number,
-                'is_valid': False,
-                'region': None,
-                'country_code': None
-            }
+            logger.warning(f"Phone number parsing failed for '{phone_number}': {e}")
+            return {'is_filipino': False, 'is_valid': False, 'formatted_number': phone_number, 'region': 'Error'}
 
-# --- FilipinoBotManager with Auto-Register for groups/channels ---
+# --- Main Bot Logic ---
 class FilipinoBotManager:
-    def __init__(self):
-        if not BOT_TOKEN:
-            raise ValueError("BOT_TOKEN environment variable is required!")
-        if not ADMIN_ID:
-            raise ValueError("ADMIN_ID environment variable is required!")
-        self.db = DatabaseManager()
-        self.verifier = PhoneVerifier()
-        self.rate_limiter = RateLimiter()
-        self.spam_words = set(['spam', 'viagra', 'crypto', 'earn money', 'bit.ly', 't.me/', 'porn', 'xxx', 'loan', 'http://', 'https://'])
-        self.blocked_users = set()
+    def __init__(self, db: DatabaseManager, limiter: RateLimiter):
+        self.db = db
+        self.rate_limiter = limiter
+        # A simple set of words to detect potential spam.
+        self.spam_words = {'spam', 'viagra', 'crypto', 'earn money', 'bit.ly', 'porn', 'xxx', 'loan'}
+        self.blocked_user_cache = set()
 
-    async def generate_invite_links(self, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
-        managed_groups = self.db.get_managed_groups()
-        invite_messages = []
-        if not managed_groups:
-            return "❌ No managed groups found. Add the bot to groups or channels first and make it admin."
-        for chat_id, chat_title, chat_type in managed_groups:
-            try:
-                invite_link = await context.bot.create_chat_invite_link(
-                    chat_id=chat_id,
-                    member_limit=1,
-                    name=f"Filipino-{user_id}",
-                    creates_join_request=False
-                )
-                group_type = "🔒 Private" if chat_type == "private" else "👥 Group" if chat_type == "group" else "📢 Channel"
-                invite_messages.append(f"{group_type} **{chat_title}**\n🔗 {invite_link.invite_link}")
-            except Exception as e:
-                logger.error(f"Failed to create invite link for {chat_title}: {e}")
-                invite_messages.append(f"❌ **{chat_title}** - Failed to create invite link")
-        return "\n\n".join(invite_messages)
+    async def load_blocked_users(self):
+        """Loads banned user IDs into a cache for faster checks."""
+        async with aiosqlite.connect(self.db.db_path) as db:
+            async with db.execute('SELECT user_id FROM verified_users WHERE is_banned = TRUE') as cursor:
+                rows = await cursor.fetchall()
+                self.blocked_user_cache = {row[0] for row in rows}
+        logger.info(f"Loaded {len(self.blocked_user_cache)} blocked users into cache.")
 
-    def is_spam_message(self, message: str) -> bool:
-        message_lower = message.lower()
-        if any(word in message_lower for word in self.spam_words):
-            return True
-        if any(char * 5 in message for char in message):
-            return True
-        if len(message) > 10:
-            uppercase_ratio = sum(1 for c in message if c.isupper()) / len(message)
-            if uppercase_ratio > 0.7:
-                return True
-        return False
-
-    async def block_user(self, user_id: int, reason: str, context=None):
-        self.blocked_users.add(user_id)
-        self.db.ban_user(user_id)
-        self.db.log_spam_incident(user_id, "block", reason)
-        try:
-            if context:
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"🚫 **User Blocked**\n\nUser ID: `{user_id}`\nReason: {reason}",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-        except Exception as e:
-            logger.warning(f"Failed to notify admin of blocked user: {e}")
-
-    async def send_invite_links_or_prompt_start(self, user, context, invite_links_msg):
+    async def block_user(self, context: ContextTypes.DEFAULT_TYPE, user_id: int, reason: str):
+        """Blocks a user, updates the database, and notifies the admin."""
+        if user_id in self.blocked_user_cache:
+            return
+        self.blocked_user_cache.add(user_id)
+        await self.db.ban_user(user_id)
+        await self.db.log_spam_incident(user_id, "block", reason)
+        logger.warning(f"User {user_id} blocked. Reason: {reason}")
         try:
             await context.bot.send_message(
-                user.id,
-                invite_links_msg,
-                parse_mode=ParseMode.MARKDOWN,
+                ADMIN_ID,
+                f"🚫 **User Blocked**\n\nUser ID: `{user_id}`\nReason: {reason}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except TelegramError as e:
+            logger.error(f"Failed to send admin notification about block: {e}")
+
+    async def generate_invite_links(self, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
+        """Generates one-time invite links for all managed groups."""
+        managed_groups = await self.db.get_managed_groups()
+        if not managed_groups:
+            return "❌ No managed groups found. Please ask the admin to configure the bot."
+            
+        link_tasks = []
+        for group in managed_groups:
+            link_tasks.append(self._create_single_invite_link(context, group, user_id))
+            
+        results = await asyncio.gather(*link_tasks)
+        return "\n\n".join(results)
+
+    async def _create_single_invite_link(self, context, group, user_id):
+        """Helper to create an invite link for one group. Catches errors gracefully."""
+        try:
+            # creates_join_request should be True if you want to approve them via the bot
+            expire_date = datetime.now() + timedelta(days=1)
+            invite_link = await context.bot.create_chat_invite_link(
+                chat_id=group['chat_id'],
+                member_limit=1,
+                name=f"Invite for user {user_id}",
+                expire_date=expire_date
+            )
+            group_type_icon = "👥" if group['chat_type'] == "group" else "📢"
+            return f"{group_type_icon} **{group['chat_title']}**\n🔗 {invite_link.invite_link}"
+        except TelegramError as e:
+            logger.error(f"Failed to create invite link for {group['chat_title']} ({group['chat_id']}): {e}")
+            await context.bot.send_message(ADMIN_ID, f"Error creating invite for {group['chat_title']}: {e}")
+            return f"❌ **{group['chat_title']}** - Could not create an invite link. The bot might not have the correct permissions."
+
+    # --- Command Handlers ---
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if user.id in self.blocked_user_cache:
+            await update.message.reply_text("❌ You are blocked from using this service.")
+            return
+
+        if await self.db.is_verified(user.id):
+            await update.message.reply_text(
+                "✅ You are already verified! Use /groups to get new invite links.",
                 reply_markup=ReplyKeyboardRemove()
             )
-        except Exception as e:
-            logger.warning(f"Could not send private invite to user {user.id}: {e}")
-            if hasattr(user, "username") and user.username:
-                fallback_msg = (
-                    f"❗ Hi @{user.username}, I couldn't send you your group invite links in private.\n\n"
-                    f"➡️ Please open [this bot in private chat](https://t.me/{BOT_USERNAME}) and click /start. "
-                    f"Once you have done that, use /groups to get your invite links."
+            return
+        
+        verification_msg = (
+            f"🇵🇭 **Filipino Verification**\n\n"
+            f"Hello {user.first_name}! To join our exclusive groups, we need to verify that you are from the Philippines.\n\n"
+            f"Please tap the button below to share your phone number. This is a one-time verification."
+        )
+        contact_keyboard = [[KeyboardButton("📱 Share my Philippine Phone Number", request_contact=True)]]
+        contact_markup = ReplyKeyboardMarkup(contact_keyboard, one_time_keyboard=True, resize_keyboard=True)
+        await update.message.reply_text(verification_msg, reply_markup=contact_markup)
+
+    async def contact_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        contact = update.message.contact
+        
+        if not contact or contact.user_id != user.id:
+            await update.message.reply_text("❌ Please share your own contact information using the button.", reply_markup=ReplyKeyboardRemove())
+            return
+
+        if user.id in self.blocked_user_cache:
+            await update.message.reply_text("❌ You are blocked.", reply_markup=ReplyKeyboardRemove())
+            return
+            
+        if not self.rate_limiter.can_verify(user.id):
+            await self.block_user(context, user.id, "Exceeded verification attempts")
+            await update.message.reply_text("⚠️ You have made too many verification attempts and have been blocked.", reply_markup=ReplyKeyboardRemove())
+            return
+        
+        self.rate_limiter.record_attempt(user.id, 'verification')
+        phone_result = self.verifier.verify_phone_number(contact.phone_number)
+
+        if phone_result['is_filipino']:
+            await self.db.add_verified_user(user.id, user.username, user.first_name, phone_result['formatted_number'])
+            
+            # Notify admin
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"✅ **New Verified User**\n\n"
+                f"**User:** {user.mention_markdown()}\n"
+                f"**ID:** `{user.id}`\n"
+                f"**Phone:** `{phone_result['formatted_number']}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+            # Send links to user
+            invite_links = await self.generate_invite_links(context, user.id)
+            success_msg = (
+                f"✅ **Verification Successful!** 🇵🇭\n\n"
+                f"Welcome, {user.first_name}! You are now verified.\n\n"
+                f"Here are your personal, one-time-use invite links. Please do not share them.\n\n"
+                f"{invite_links}"
+            )
+            await update.message.reply_text(success_msg, reply_markup=ReplyKeyboardRemove(), parse_mode=ParseMode.MARKDOWN)
+
+        else:
+            await update.message.reply_text(
+                f"❌ **Verification Failed**\n\n"
+                f"The number you provided (`{phone_result['formatted_number']}`) does not appear to be a valid Philippine phone number. "
+                f"Please try again with a +63 number.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            await self.db.log_spam_incident(user.id, "invalid_phone", f"Provided: {phone_result['formatted_number']}")
+
+    async def groups_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if user.id in self.blocked_user_cache:
+            await update.message.reply_text("❌ You are blocked.")
+            return
+
+        if not await self.db.is_verified(user.id):
+            await update.message.reply_text("❌ You must be verified first. Please use the /start command.")
+            return
+
+        invite_links = await self.generate_invite_links(context, user.id)
+        await update.message.reply_text(
+            f"✅ Here are your new personal invite links:\n\n{invite_links}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if user.id in self.blocked_user_cache:
+            await update.message.reply_text("Status: **BLOCKED** 🚫")
+            return
+        
+        if await self.db.is_verified(user.id):
+            phone = await self.db.get_user_phone(user.id)
+            await update.message.reply_text(f"✅ Status: **VERIFIED** 🇵🇭\nPhone on record: `{phone}`")
+        else:
+            await update.message.reply_text(" Status: **NOT VERIFIED** ❌\nUse /start to begin verification.")
+
+    # --- Admin and Event Handlers ---
+
+    async def my_chat_member_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handles when the bot's status changes in a group (added, promoted, removed)."""
+        chat = update.my_chat_member.chat
+        new_status = update.my_chat_member.new_chat_member
+        
+        if new_status.status == new_status.ADMINISTRATOR:
+            logger.info(f"Bot was promoted to admin in {chat.title} ({chat.id}).")
+            # We check for can_invite_users permission specifically.
+            if new_status.can_invite_users:
+                await self.db.add_managed_group(chat.id, chat.title, chat.type)
+                logger.info(f"Auto-registered group: {chat.title}")
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"✅ **Auto-Registered Group**\n\nThe bot was made an admin with invite permissions in:\n"
+                    f"**Title:** {chat.title}\n"
+                    f"**ID:** `{chat.id}`"
                 )
             else:
-                fallback_msg = (
-                    f"❗ I couldn't send you your group invite links in private.\n\n"
-                    f"➡️ Please open this bot in private chat (@{BOT_USERNAME}), press /start, then use /groups to get your invite links."
-                )
+                 await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ **Admin Promotion Incomplete**\n\nThe bot was made an admin in {chat.title} but lacks the 'Invite Users' permission, so it was not added to managed groups."
+                 )
+        elif new_status.status in [new_status.MEMBER, new_status.LEFT, new_status.KICKED]:
+            # If bot is demoted or removed, you might want to deactivate it in the DB.
+            logger.info(f"Bot was removed or demoted in {chat.title} ({chat.id}).")
+
+    async def join_request_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handles new users trying to join a group where the bot is an admin."""
+        join_request = update.chat_join_request
+        user = join_request.from_user
+        chat = join_request.chat
+
+        if user.id in self.blocked_user_cache:
+            await context.bot.decline_chat_join_request(chat.id, user.id)
+            logger.info(f"Declined join request from blocked user {user.id} for chat {chat.id}")
+            return
+            
+        if not self.rate_limiter.can_join(user.id):
+            await context.bot.decline_chat_join_request(chat.id, user.id)
+            await self.db.log_spam_incident(user.id, "join_rate_limit", f"Chat: {chat.id}")
+            logger.warning(f"Rate limited join request from {user.id} for chat {chat.id}")
+            return
+            
+        self.rate_limiter.record_attempt(user.id, 'join')
+
+        if await self.db.is_verified(user.id):
+            try:
+                await context.bot.approve_chat_join_request(chat.id, user.id)
+                logger.info(f"Auto-approved verified user {user.id} for chat {chat.id}")
+                await context.bot.send_message(user.id, f"✅ Your request to join **{chat.title}** was automatically approved!", parse_mode=ParseMode.MARKDOWN)
+            except TelegramError as e:
+                logger.error(f"Failed to approve join request for {user.id}: {e}")
+        else:
+            # User is not verified, prompt them to start verification.
             try:
                 await context.bot.send_message(
                     user.id,
-                    fallback_msg,
-                    parse_mode=ParseMode.MARKDOWN,
-                    disable_web_page_preview=True
-                )
-            except Exception:
-                pass
-            try:
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"⚠️ Failed to send invite links to user {user.id}. Reason: {e}",
+                    f"👋 Hello! To join **{chat.title}**, you first need to verify your identity with me.\n\n"
+                    f"Please click here -> /start to begin the one-time verification process.",
                     parse_mode=ParseMode.MARKDOWN
                 )
-            except Exception:
-                pass
-
-    async def handle_my_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat = update.my_chat_member.chat
-        new_status = update.my_chat_member.new_chat_member.status
-        if new_status in ['administrator', 'creator']:
-            self.db.add_managed_group(chat.id, chat.title or chat.username, chat.type)
-            logger.info(f"Auto-registered {chat.type} [{chat.title}] ({chat.id}) as managed group.")
-            try:
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"✅ *Auto-registered {chat.type}*\n\n"
-                    f"• Title: {chat.title}\n"
-                    f"• ID: `{chat.id}`\n"
-                    f"• Type: `{chat.type}`\n"
-                    f"Bot is now admin and registered as managed group!",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception:
-                pass
-        elif new_status in ['left', 'kicked']:
-            logger.info(f"Bot removed from {chat.type} [{chat.title}] ({chat.id})")
-
-    async def handle_new_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message or not update.message.new_chat_members:
-            return
-        bot_user = await context.bot.get_me()
-        for member in update.message.new_chat_members:
-            if member.id == bot_user.id:
-                chat = update.effective_chat
-                try:
-                    bot_member = await context.bot.get_chat_member(chat.id, bot_user.id)
-                    if bot_member.status in ['administrator', 'creator']:
-                        self.db.add_managed_group(chat.id, chat.title, chat.type)
-                        await context.bot.send_message(
-                            ADMIN_ID,
-                            f"🆕 **Bot Added to New Group**\n\n**Group:** {chat.title}\n**Type:** {chat.type}\n**ID:** `{chat.id}`\n**Status:** Added to managed groups ✅",
-                            parse_mode=ParseMode.MARKDOWN
-                        )
-                    else:
-                        await context.bot.send_message(
-                            ADMIN_ID,
-                            f"⚠️ **Bot Added but Not Admin**\n\n**Group:** {chat.title}\n**Issue:** Bot needs admin privileges to create invite links",
-                            parse_mode=ParseMode.MARKDOWN
-                        )
-                except Exception as e:
-                    logger.error(f"Error checking bot admin status: {e}")
-
-    async def handle_join_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            if not update.chat_join_request:
-                return
-            join_request = update.chat_join_request
-            user = join_request.from_user
-            chat = join_request.chat
-            if user.is_bot or user.id == ADMIN_ID:
-                await context.bot.approve_chat_join_request(chat.id, user.id)
-                return
-            if user.id in self.blocked_users:
+                # You can choose to decline immediately or leave it pending. Declining is cleaner.
                 await context.bot.decline_chat_join_request(chat.id, user.id)
-                self.db.log_spam_incident(user.id, "join_request_rejected", "Blocked user tried to join")
-                return
-            if not self.rate_limiter.can_join(user.id):
-                await context.bot.decline_chat_join_request(chat.id, user.id)
-                self.db.log_spam_incident(user.id, "join_request_rate_limit", "Too many join attempts")
-                return
-            self.rate_limiter.record_join(user.id)
-            self.db.add_join_request(user.id, chat.id)
-            if self.db.is_verified(user.id):
-                stored_phone = self.db.get_user_phone(user.id)
-                if stored_phone:
-                    phone_result = self.verifier.verify_phone_number(stored_phone)
-                    if phone_result['is_filipino']:
-                        await context.bot.approve_chat_join_request(chat.id, user.id)
-                        self.db.update_join_request_status(user.id, chat.id, 'approved')
-                        try:
-                            await context.bot.send_message(user.id,
-                                f"🎉 **Welcome!** ✅\n\nHi {user.first_name}, you've been auto-approved to join **{chat.title}**!\n\nYour Filipino verification status is confirmed. Enjoy the community! 🇵🇭",
-                                parse_mode=ParseMode.MARKDOWN
-                            )
-                        except Exception: pass
-                        try:
-                            await context.bot.send_message(ADMIN_ID,
-                                f"✅ **Auto-Approved Join Request**\n\n**User:** {user.first_name} (@{user.username or 'no_username'})\n**ID:** `{user.id}`\n**Chat:** {chat.title} (`{chat.id}`)\n**Status:** Verified Filipino User - Auto-approved",
-                                parse_mode=ParseMode.MARKDOWN
-                            )
-                        except Exception: pass
-                        return
-            verification_msg = (
-                f"🇵🇭 **Filipino Verification Required**\n\n"
-                f"Hi {user.first_name}! To join **{chat.title}**, please verify your Filipino status by sharing your Philippine phone number.\n\n"
-                f"**How to verify:**\n"
-                f"1. Click the button below to share your phone number\n"
-                f"2. Only Philippine numbers (+63) are accepted\n"
-                f"3. You'll be auto-approved once verified\n\n"
-                f"**Your privacy:** Your phone number is only used for verification purposes.\n\n"
-                f"👇 **Click to share your phone number:**"
-            )
-            contact_keyboard = [[KeyboardButton("📱 Share my Philippine Phone Number", request_contact=True)]]
-            contact_markup = ReplyKeyboardMarkup(contact_keyboard, one_time_keyboard=True, resize_keyboard=True)
-            try:
-                await context.bot.send_message(user.id, verification_msg, reply_markup=contact_markup, parse_mode=ParseMode.MARKDOWN)
-            except Exception as e:
-                logger.error(f"Could not send verification message to user {user.id}: {e}")
-                await context.bot.decline_chat_join_request(chat.id, user.id)
-                self.db.update_join_request_status(user.id, chat.id, 'rejected')
-        except Exception as e:
-            logger.error(f"Error handling join request: {e}")
-
-    async def start_verification(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if user.id in self.blocked_users:
-            await update.message.reply_text("❌ You are blocked due to spam or abuse.", reply_markup=ReplyKeyboardRemove())
-            return
-        if self.db.is_verified(user.id):
-            await update.message.reply_text(
-                "✅ You are already verified as a Filipino user! 🇵🇭\n\nYou can now join Filipino groups and channels without additional verification.",
-                reply_markup=ReplyKeyboardRemove()
-            )
-            return
-        contact_keyboard = [[KeyboardButton("📱 I-Share ang Phone Number Ko", request_contact=True)]]
-        contact_markup = ReplyKeyboardMarkup(contact_keyboard, one_time_keyboard=True, resize_keyboard=True)
-        verification_msg = (
-            f"🇵🇭 **Filipino Verification**\n\n"
-            f"Hi {user.first_name}! To verify your Filipino status, please share your Philippine phone number by clicking the button below.\n\n"
-            f"**Requirements:**\n"
-            f"• Philippine number (+63) only\n"
-            f"• Click the button below to share\n"
-            f"• Auto-approval once verified\n\n"
-            f"**Benefits:**\n"
-            f"• Access to Filipino groups/channels\n"
-            f"• Auto-approval for future join requests\n"
-            f"• One-time verification process\n\n"
-            f"⚠️ *Important:* You must open this bot in private chat and click /start to receive private invites! "
-            f"If you do not receive your links, do this and use /groups again.\n\n"
-            f"👇 **Click to share:**"
-        )
-        await update.message.reply_text(verification_msg, parse_mode=ParseMode.MARKDOWN, reply_markup=contact_markup)
-
-    async def handle_contact_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message.contact:
-            return
-        user = update.effective_user
-        contact = update.message.contact
-        if user.id in self.blocked_users:
-            await update.message.reply_text("❌ You are blocked due to spam or abuse.", reply_markup=ReplyKeyboardRemove())
-            return
-        if contact.user_id != user.id:
-            await update.message.reply_text("❌ Only your own phone number can be verified!", reply_markup=ReplyKeyboardRemove())
-            return
-        if not self.rate_limiter.can_verify(user.id):
-            await self.block_user(user.id, "Too many verification attempts", context)
-            await update.message.reply_text("⚠️ Too many verification attempts. Please try again tomorrow.", reply_markup=ReplyKeyboardRemove())
-            self.db.log_spam_incident(user.id, "verification_rate_limit", "Exceeded verification attempts")
-            return
-        self.rate_limiter.record_verification(user.id)
-        phone_result = self.verifier.verify_phone_number(contact.phone_number)
-        if phone_result['is_filipino']:
-            self.db.add_verified_user(user.id, user.username, user.first_name, contact.phone_number)
-            invite_links_msg = (
-                f"✅ **Verified!** 🇵🇭\n\n"
-                f"Welcome to the Filipino community, {user.first_name}!\n\n"
-                f"📱 **Verified Number:** {phone_result['formatted_number']}\n"
-                f"🎉 **Status:** Approved for all Filipino channels/groups\n"
-                f"🚀 **Benefit:** Auto-approval for future join requests!\n\n"
-                f"**🔗 Your Personal Invite Links:**\n"
-                f"{await self.generate_invite_links(context, user.id)}\n\n"
-                f"⚠️ **Important:** These links are ONE-TIME USE only and cannot be shared!\n\n"
-                f"__If you do not receive the links, please open this bot in private chat and click /start, then use /groups to get your links.__"
-            )
-            await self.send_invite_links_or_prompt_start(user, context, invite_links_msg)
-            try:
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"✅ **New Verified User**\n\n**User:** {user.first_name} (@{user.username or 'no_username'})\n"
-                    f"**ID:** `{user.id}`\n**Phone:** {phone_result['formatted_number']}\n"
-                    f"**Status:** Successfully verified as Filipino",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception:
-                pass
-        else:
-            await update.message.reply_text(
-                f"❌ **Invalid Phone Number!**\n\n• **Number:** {phone_result['formatted_number']}\n• **Expected:** Philippines 🇵🇭 (+63)\n"
-                f"• **Detected Region:** {phone_result.get('region', 'Unknown')}\n\n"
-                "**Please try again with a valid Philippine phone number.**\n\n"
-                "Common formats:\n• +63 9XX XXX XXXX\n• 09XX XXX XXXX\n• 63 9XX XXX XXXX",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=ReplyKeyboardRemove()
-            )
-            self.db.log_spam_incident(user.id, "invalid_phone", f"Provided: {phone_result['formatted_number']}")
-
-    async def handle_status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if self.db.is_verified(user.id):
-            phone = self.db.get_user_phone(user.id)
-            status_msg = f"✅ **Verification Status: VERIFIED** 🇵🇭\n\n**User:** {user.first_name}\n**Phone:** {phone}\n**Status:** Active Filipino User\n**Benefits:** Auto-approval for Filipino groups\n\nYou're all set! 🎉"
-        else:
-            status_msg = f"❌ **Verification Status: NOT VERIFIED**\n\n**User:** {user.first_name}\n**Status:** Unverified\n\nTo get verified, use /start and share your Philippine phone number."
-        await update.message.reply_text(status_msg, parse_mode=ParseMode.MARKDOWN)
-
-    async def handle_groups_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if not self.db.is_verified(user.id):
-            await update.message.reply_text(
-                "❌ You need to be verified first! Use /start to verify your Filipino phone number.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        invite_links_msg = f"🇵🇭 **Available Filipino Groups**\n\nHi {user.first_name}! Here are your personal invite links:\n\n" \
-                           f"{await self.generate_invite_links(context, user.id)}\n\n" \
-                           f"⚠️ **Important Notes:**\n" \
-                           f"• These links are ONE-TIME USE only\n" \
-                           f"• Cannot be shared with others\n" \
-                           f"• Links expire after you join\n" \
-                           f"• Use /groups again to get new links\n\n" \
-                           f"💡 **Tip:** Join the groups you're interested in right away!\n\n" \
-                           f"__If you do not receive the links, please open this bot in private chat and click /start, then use /groups again.__"
-        await self.send_invite_links_or_prompt_start(user, context, invite_links_msg)
-
-    async def handle_admin_add_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if user.id != ADMIN_ID:
-            await update.message.reply_text("❌ Admin only command!")
-            return
-        if not context.args or len(context.args) < 2:
-            await update.message.reply_text(
-                "Usage: /addgroup <chat_id> <group_name>\nExample: /addgroup -1001234567890 Filipino Community"
-            )
-            return
-        try:
-            chat_id = int(context.args[0])
-            group_name = " ".join(context.args[1:])
-            chat = await context.bot.get_chat(chat_id)
-            bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
-            if bot_member.status in ['administrator', 'creator']:
-                self.db.add_managed_group(chat_id, group_name, chat.type)
-                await update.message.reply_text(
-                    f"✅ Added **{group_name}** to managed groups!\nChat ID: `{chat_id}`",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ Bot is not admin in **{group_name}**!\nMake the bot admin first.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-        except ValueError:
-            await update.message.reply_text("❌ Invalid chat ID format!")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-
-    async def handle_help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        help_msg = (
-            "🇵🇭 *Filipino Verification Bot Help*\n\n"
-            "*Commands:*\n"
-            "• `/start` - Start verification process\n"
-            "• `/status` - Check your verification status\n"
-            "• `/groups` - Get your invite links\n"
-            "• `/help` - Show this help message\n\n"
-            "*How it works:*\n"
-            "1. Use `/start` to begin verification (in private chat!)\n"
-            "2. Share your Philippine phone number\n"
-            "3. Get auto-approved for Filipino groups\n"
-            "4. One-time verification for all groups\n\n"
-            "*Supported formats:*\n"
-            "• +63 9XX XXX XXXX\n"
-            "• 09XX XXX XXXX\n"
-            "• 63 9XX XXX XXXX\n\n"
-            "⚠️ *Important:* You must open this bot in private chat and click /start to receive private invites! "
-            "If you do not receive your links, do this and use /groups again.\n\n"
-            "*Need help?* Contact the admin if you have issues."
-        )
-        await update.message.reply_text(help_msg, parse_mode=ParseMode.MARKDOWN)
-
+            except TelegramError as e:
+                logger.warning(f"Could not send verification prompt to user {user.id}: {e}")
+                
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
-        logger.error(f"Exception while handling an update: {context.error}")
+        """Log Errors caused by Updates."""
+        logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
+        
+        # Optionally, notify the admin about critical errors
+        if isinstance(context.error, TelegramError):
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"🚨 **Bot Error**\n\n"
+                    f"An error occurred: `{context.error}`\n\n"
+                    f"Update: `{update}`"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send error notification to admin: {e}")
 
-# --- Application and Main ---
-application = None
+# --- Application Setup ---
+async def main():
+    """Main function to set up and run the bot."""
+    if not all([BOT_TOKEN, ADMIN_ID, BOT_USERNAME]):
+        logger.critical("FATAL: BOT_TOKEN, ADMIN_ID, and BOT_USERNAME environment variables must be set.")
+        sys.exit(1)
 
-def signal_handler(signum, frame):
-    logger.info("Received shutdown signal, stopping bot...")
-    if application:
-        asyncio.create_task(application.stop())
-    sys.exit(0)
+    # Initialize components
+    db_manager = DatabaseManager()
+    await db_manager.init_database()
+    
+    rate_limiter = RateLimiter()
+    bot_manager = FilipinoBotManager(db_manager, rate_limiter)
+    await bot_manager.load_blocked_users()
 
-def main():
-    global application
-    if not BOT_TOKEN or not ADMIN_ID:
-        logger.error("BOT_TOKEN and ADMIN_ID environment variables are required!")
-        return
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    bot_manager = FilipinoBotManager()
+    # Build the application
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # --- Add Handlers ---
+    # Command Handlers
+    application.add_handler(CommandHandler("start", bot_manager.start_command, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("status", bot_manager.status_command, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("groups", bot_manager.groups_command, filters=filters.ChatType.PRIVATE))
+
+    # Message Handlers
+    application.add_handler(MessageHandler(filters.CONTACT & filters.ChatType.PRIVATE, bot_manager.contact_handler))
+    
+    # Event Handlers
+    application.add_handler(ChatMemberHandler(bot_manager.my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+    application.add_handler(ChatJoinRequestHandler(bot_manager.join_request_handler))
+
+    # Error Handler
     application.add_error_handler(bot_manager.error_handler)
-    application.add_handler(CommandHandler("start", bot_manager.start_verification))
-    application.add_handler(CommandHandler("status", bot_manager.handle_status_command))
-    application.add_handler(CommandHandler("groups", bot_manager.handle_groups_command))
-    application.add_handler(CommandHandler("addgroup", bot_manager.handle_admin_add_group))
-    application.add_handler(CommandHandler("help", bot_manager.handle_help_command))
-    application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_manager.handle_new_chat_member))
-    application.add_handler(ChatMemberHandler(bot_manager.handle_my_chat_member, chat_member_types="my_chat_member"))  # <-- Fixed auto-register handler
-    application.add_handler(ChatJoinRequestHandler(bot_manager.handle_join_request))
-    logger.info("🇵🇭 Filipino Verification Bot starting...")
+
+    # Start the bot
+    logger.info("Starting bot...")
     try:
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            close_loop=False
-        )
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info(f"Bot started successfully as @{BOT_USERNAME}")
+        
+        # Keep the script running
+        while True:
+            await asyncio.sleep(3600) # Sleep for an hour
+
     except Exception as e:
-        logger.error(f"Bot crashed: {e}")
+        logger.critical(f"Bot failed to start: {e}")
     finally:
+        logger.info("Stopping bot...")
+        await application.stop()
+        await application.shutdown()
         logger.info("Bot stopped.")
 
 if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutdown signal received.")
